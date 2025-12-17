@@ -1822,6 +1822,7 @@ def save_checkpoint_and_time(
     checkpointing_context,
     non_persistent_ckpt=False,
     train_data_iterator=None,
+    eval_loss=None,
 ):
     args = get_args()
     timers = get_timers()
@@ -1849,6 +1850,7 @@ def save_checkpoint_and_time(
         non_persistent_ckpt=non_persistent_ckpt,
         train_data_iterator=train_data_iterator,
         preprocess_common_state_dict_fn=preprocess_common_state_dict,
+        eval_loss=eval_loss,
     )
     if should_disable_forward_pre_hook(args):
         enable_forward_pre_hook(model)
@@ -1935,6 +1937,7 @@ def checkpoint_and_decide_exit(
     num_floating_point_operations_so_far,
     checkpointing_context,
     train_data_iterator,
+    eval_loss = None,
 ):
     """Save checkpoint and decide whether to exit based on arguments (e.g., if
     --exit-duration-in-mins is set). Actual exit happens in main training loop
@@ -1956,6 +1959,7 @@ def checkpoint_and_decide_exit(
                     num_floating_point_operations_so_far,
                     checkpointing_context,
                     train_data_iterator=train_data_iterator,
+                    eval_loss=eval_loss,
                 )
             print_datetime('exiting program after receiving SIGTERM.')
 
@@ -1971,6 +1975,7 @@ def checkpoint_and_decide_exit(
             num_floating_point_operations_so_far,
             checkpointing_context,
             train_data_iterator=train_data_iterator,
+            eval_loss=eval_loss,
         )
         saved_checkpoint = True
 
@@ -1988,6 +1993,7 @@ def checkpoint_and_decide_exit(
             checkpointing_context,
             non_persistent_ckpt=True,
             train_data_iterator=train_data_iterator,
+            eval_loss=eval_loss,
         )
         saved_checkpoint = True
 
@@ -2009,6 +2015,7 @@ def checkpoint_and_decide_exit(
                     num_floating_point_operations_so_far,
                     checkpointing_context,
                     train_data_iterator=train_data_iterator,
+                    eval_loss=eval_loss,
                 )
             print_datetime(f'exiting program after {train_time} minutes')
 
@@ -2025,6 +2032,7 @@ def checkpoint_and_decide_exit(
                 num_floating_point_operations_so_far,
                 checkpointing_context,
                 train_data_iterator=train_data_iterator,
+                eval_loss=eval_loss,
             )
         torch.distributed.barrier()
         print_datetime(f'exiting program at iteration {iteration}')
@@ -2358,6 +2366,7 @@ def train(
         )
 
         # Evaluation.
+        eval_loss = None
         if args.eval_interval and iteration % args.eval_interval == 0 and args.do_valid:
             if args.log_energy:
                 energy_monitor.pause()
@@ -2370,7 +2379,7 @@ def train(
                 gc.collect()
             prefix = f'iteration {iteration}'
             timers('eval-time', log_level=0).start(barrier=True)
-            evaluate_and_print_results(
+            all_total_loss_dict = evaluate_and_print_results(
                 prefix,
                 forward_step_func,
                 valid_data_iterator,
@@ -2382,6 +2391,8 @@ def train(
                 write_to_tensorboard=True,
                 non_loss_data_func=non_loss_data_func,
             )
+            if len(all_total_loss_dict) > 0 and 'lm loss' in all_total_loss_dict[0]:
+                eval_loss = all_total_loss_dict[0]['lm loss'].item()
             eval_duration += timers('eval-time').elapsed()
             eval_iterations += args.eval_iters
             timers('eval-time').stop()
@@ -2417,6 +2428,7 @@ def train(
             num_floating_point_operations_so_far,
             checkpointing_context,
             train_data_iterator,
+            eval_loss,
         )
         if should_exit:
             break
@@ -2671,6 +2683,8 @@ def evaluate_and_print_results(
     print_rank_last('-' * length)
     print_rank_last(string)
     print_rank_last('-' * length)
+
+    return [total_loss_dict]
 
 
 def cyclic_iter(iter):

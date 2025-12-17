@@ -2086,6 +2086,10 @@ def _add_checkpointing_args(parser):
                        help='Output directory to save checkpoints to.')
     group.add_argument('--save-interval', '--persistent-save-interval', type=int, default=None,
                        help='Number of iterations between persistent checkpoint saves.')
+    group.add_argument("--eval-loss-save", type=str, default=None, 
+                       help="Output directory to save eval loss to. The eval loss will be saved as a text file.")
+    group.add_argument('--keep-last-n-checkpoints', type=int, default=None,
+                       help="Number of checkpoints to keep. If not specified, all checkpoints will be kept.")
     group.add_argument('--no-save-optim', action='store_true', default=None,
                        help='Do not save current optimizer.')
     group.add_argument('--no-save-rng', action='store_true', default=None,

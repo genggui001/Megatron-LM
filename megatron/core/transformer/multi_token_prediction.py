@@ -423,9 +423,9 @@ class MultiTokenPredictionLayer(MegatronModule):
             [s, b, h], and optionally the updated context tensor if cross-attention is used.
         """
         assert context is None, f"multi token prediction + cross attention is not yet supported."
-        assert (
-            packed_seq_params is None
-        ), f"multi token prediction + sequence packing is not yet supported."
+        # assert (
+        #     packed_seq_params is None
+        # ), f"multi token prediction + sequence packing is not yet supported."
 
         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
 
@@ -578,6 +578,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         self.submodules = _get_mtp_block_submodules(config, spec)
         self.mtp_loss_scaling_factor = config.mtp_loss_scaling_factor
         self.vp_stage = vp_stage
+        self.mtp_steps = config.mtp_steps
         self._build_layers()
         assert len(self.layers) > 0, "MultiTokenPredictionBlock must have at least one layer."
 
@@ -638,13 +639,19 @@ class MultiTokenPredictionBlock(MegatronModule):
             loss_mask = torch.ones_like(labels)
 
         hidden_states_main_model = hidden_states
-        for layer_number in range(len(self.layers)):
+
+        if self.mtp_steps is not None:
+            mtp_steps = self.mtp_steps
+        else:
+            mtp_steps = len(self.layers)
+
+        for mtp_step_idx in range(mtp_steps):
             # Calc logits for the current Multi-Token Prediction (MTP) layers.
             input_ids, _ = roll_tensor(input_ids, shifts=-1, dims=-1)
             # embedding
             decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
             # norm, linear projection and transformer
-            hidden_states = self.layers[layer_number](
+            hidden_states = self.layers[mtp_step_idx % len(self.layers)](
                 decoder_input=decoder_input,
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
@@ -662,17 +669,20 @@ class MultiTokenPredictionBlock(MegatronModule):
             )
             # Calc loss for the current Multi-Token Prediction (MTP) layers.
             labels, _ = roll_tensor(labels, shifts=-1, dims=-1)
-            loss_mask, num_tokens = roll_tensor(loss_mask, shifts=-1, dims=-1)
+            new_loss_mask, _ = roll_tensor(loss_mask, shifts=-1, dims=-1)
+            loss_mask = loss_mask * new_loss_mask
+            num_tokens = loss_mask.sum()
+
             mtp_loss = compute_language_model_loss(labels, mtp_logits)
             mtp_loss = loss_mask * mtp_loss
             if self.training:
                 MTPLossLoggingHelper.save_loss_to_tracker(
                     torch.sum(mtp_loss) / num_tokens,
-                    layer_number,
-                    self.config.mtp_num_layers,
+                    mtp_step_idx,
+                    mtp_steps,
                     avg_group=parallel_state.get_tensor_and_context_parallel_group(),
                 )
-            mtp_loss_scale = self.mtp_loss_scaling_factor / self.config.mtp_num_layers
+            mtp_loss_scale = self.mtp_loss_scaling_factor / mtp_steps
             if self.config.calculate_per_token_loss:
                 hidden_states_main_model = MTPLossAutoScaler.apply(
                     hidden_states_main_model, mtp_loss_scale * mtp_loss
