@@ -814,9 +814,9 @@ def validate_args(args, defaults={}):
     if args.save is not None:
         assert args.save_interval is not None
         assert args.save_interval > 0
-        if args.save_retain_interval is not None:
-            assert args.save_retain_interval > 0
-            assert args.save_retain_interval % args.save_interval == 0
+        # if args.save_retain_interval is not None:
+        #     assert args.save_retain_interval > 0
+        #     assert args.save_retain_interval % args.save_interval == 0
     # Mixed precision checks.
     if args.fp16_lm_cross_entropy:
         assert args.fp16, 'lm cross entropy in fp16 only support in fp16 mode.'
@@ -2261,9 +2261,13 @@ def _add_checkpointing_args(parser):
                        help='Output directory to save checkpoints to.')
     group.add_argument('--save-interval', '--persistent-save-interval', type=int, default=None,
                        help='Number of iterations between persistent checkpoint saves.')
-    group.add_argument('--save-retain-interval', type=int, default=None,
-                       help='Number of iterations between retained checkpoints (other'
-                       'checkpoints _except the last checkpoint_ are automatically deleted).')
+    # group.add_argument('--save-retain-interval', type=int, default=None,
+    #                    help='Number of iterations between retained checkpoints (other'
+    #                    'checkpoints _except the last checkpoint_ are automatically deleted).')
+    group.add_argument("--eval-loss-save", type=str, default=None, 
+                       help="Output directory to save eval loss to. The eval loss will be saved as a text file.")
+    group.add_argument('--keep-last-n-checkpoints', type=int, default=None,
+                       help="Number of checkpoints to keep. If not specified, all checkpoints will be kept.")
     group.add_argument('--no-save-optim', action='store_true', default=None,
                        help='Do not save current optimizer.')
     group.add_argument('--no-save-rng', action='store_true', default=None,

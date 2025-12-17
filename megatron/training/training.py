@@ -1680,6 +1680,7 @@ def save_checkpoint_and_time(
     checkpointing_context,
     non_persistent_ckpt=False,
     train_data_iterator=None,
+    eval_loss=None,
 ):
     args = get_args()
     timers = get_timers()
@@ -1707,6 +1708,7 @@ def save_checkpoint_and_time(
         non_persistent_ckpt=non_persistent_ckpt,
         train_data_iterator=train_data_iterator,
         preprocess_common_state_dict_fn=preprocess_common_state_dict,
+        eval_loss=eval_loss,
     )
     if args.fp8:
         # Run garbage collection after checkpoint saving to free memory from
@@ -1798,6 +1800,7 @@ def checkpoint_and_decide_exit(
     num_floating_point_operations_so_far,
     checkpointing_context,
     train_data_iterator,
+    eval_loss = None,
 ):
     """Save checkpoint and decide whether to exit based on arguments (e.g., if
     --exit-duration-in-mins is set). Actual exit happens in main training loop
@@ -1819,6 +1822,7 @@ def checkpoint_and_decide_exit(
                     num_floating_point_operations_so_far,
                     checkpointing_context,
                     train_data_iterator=train_data_iterator,
+                    eval_loss=eval_loss,
                 )
             print_datetime('exiting program after receiving SIGTERM.')
 
@@ -1834,6 +1838,7 @@ def checkpoint_and_decide_exit(
             num_floating_point_operations_so_far,
             checkpointing_context,
             train_data_iterator=train_data_iterator,
+            eval_loss=eval_loss,
         )
         saved_checkpoint = True
 
@@ -1851,6 +1856,7 @@ def checkpoint_and_decide_exit(
             checkpointing_context,
             non_persistent_ckpt=True,
             train_data_iterator=train_data_iterator,
+            eval_loss=eval_loss,
         )
         saved_checkpoint = True
 
@@ -1872,6 +1878,7 @@ def checkpoint_and_decide_exit(
                     num_floating_point_operations_so_far,
                     checkpointing_context,
                     train_data_iterator=train_data_iterator,
+                    eval_loss=eval_loss,
                 )
             print_datetime(f'exiting program after {train_time} minutes')
 
@@ -1888,6 +1895,7 @@ def checkpoint_and_decide_exit(
                 num_floating_point_operations_so_far,
                 checkpointing_context,
                 train_data_iterator=train_data_iterator,
+                eval_loss=eval_loss,
             )
         print_datetime(f'exiting program at iteration {iteration}')
 
@@ -2284,6 +2292,7 @@ def train(
         )
 
         # Evaluation.
+        eval_loss = None
         if args.eval_interval and iteration % args.eval_interval == 0 and args.do_valid:
             if args.log_energy:
                 energy_monitor.pause()
@@ -2300,11 +2309,13 @@ def train(
                 rl_utils.evaluate_and_print_results_rl(valid_data_iterator, model, optimizer,
                                        iteration, write_to_tensorboard=True)
             else:
-                evaluate_and_print_results(prefix, forward_step_func,
+                all_total_loss_dict = evaluate_and_print_results(prefix, forward_step_func,
                                        valid_data_iterator, model,
                                        iteration, process_non_loss_data_func,
                                        config, verbose=False, write_to_tensorboard=True,
                                        non_loss_data_func=non_loss_data_func)
+                if len(all_total_loss_dict) > 0 and 'lm loss' in all_total_loss_dict[0]:
+                    eval_loss = all_total_loss_dict[0]['lm loss'].item()
 
             eval_duration += timers('eval-time').elapsed()
             eval_iterations += sum(args.eval_iters) if isinstance(args.eval_iters, list) else args.eval_iters
@@ -2341,6 +2352,7 @@ def train(
             num_floating_point_operations_so_far,
             checkpointing_context,
             train_data_iterator,
+            eval_loss,
         )
         if should_exit:
             break
@@ -2583,6 +2595,7 @@ def evaluate_and_print_results(
     else:
         eval_iters = args.eval_iters
     
+    all_total_loss_dict = []
     for index, (iterator, iterations) in enumerate(zip(data_iterators, eval_iters)):
         suffix = ""
         if args.multiple_validation_sets:
@@ -2629,6 +2642,10 @@ def evaluate_and_print_results(
         print_rank_last('-' * length)
         print_rank_last(string)
         print_rank_last('-' * length)
+
+        all_total_loss_dict.append(total_loss_dict)
+
+    return all_total_loss_dict
 
 
 def cyclic_iter(iter):

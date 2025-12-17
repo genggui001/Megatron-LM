@@ -4,6 +4,8 @@
 
 import contextlib
 import os
+import re
+import glob
 import random
 import shutil
 import sys
@@ -404,7 +406,7 @@ def _build_sharded_state_dict_metadata(args: Namespace) -> dict:
 
 def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far,
                     checkpointing_context=None, pipeline_rank=None, expert_rank=None, tensor_rank=None, pipeline_parallel=None, expert_parallel=None, non_persistent_ckpt=False,
-                    train_data_iterator=None, preprocess_common_state_dict_fn = None):
+                    train_data_iterator=None, preprocess_common_state_dict_fn = None, eval_loss=None):
     """Save a model, optimizer and optionally dataloader checkpoint.
 
     Checkpointing context is used to persist some checkpointing state
@@ -476,6 +478,9 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
 
     # Save dataloader state if the dataloader supports it (currently only Megatron Energon).
     maybe_save_dataloader_state(train_data_iterator, iteration, getattr(args, "dataloader_save", None))
+
+    # Save eval loss state if the eval loss supports it (currently only Megatron Energon).
+    maybe_save_eval_loss(eval_loss, iteration, getattr(args, "eval_loss_save", None))
 
     # Save distributed optimizer's custom parameter state.
     if (
@@ -631,12 +636,13 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                                            barrier=False)
         else:
             def iter_finalize_fn():
-                prev_iteration = 0
-                save_retain_interval = getattr(args, 'save_retain_interval', None)  # For backwards compatibility of tests.
-                if save_retain_interval is not None:
-                    if os.path.exists(tracker_filename):  # TODO: Make this work with MSC remote paths?
-                        with open_file(tracker_filename, 'r') as f:
-                            prev_iteration = int(f.read().strip())
+                # prev_iteration = 0
+                # save_retain_interval = getattr(args, 'save_retain_interval', None)  # For backwards compatibility of tests.
+                # if save_retain_interval is not None:
+                #     if os.path.exists(tracker_filename):  # TODO: Make this work with MSC remote paths?
+                #         with open_file(tracker_filename, 'r') as f:
+                #             prev_iteration = int(f.read().strip())
+                keep_last_n_checkpoints = getattr(args, 'keep_last_n_checkpoints', None)
                 with open_file(tracker_filename, 'w') as f:
                     f.write(str(iteration))
                 tensor_rank_to_print = (tensor_rank if tensor_rank is not None else mpu.get_tensor_model_parallel_rank()) + 1
@@ -651,29 +657,79 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                 def delete_checkpoint(args, iteration_to_delete):
                     checkpoint_name = get_checkpoint_name(args.save, iteration=iteration_to_delete,
                                                           return_base_dir=True)
-                    try:
-                        shutil.rmtree(checkpoint_name)  # TODO: Make this work with MSC remote paths?
-                        print_rank_0(f'  successfully deleted checkpoint from iteration {iteration_to_delete:7d} '
-                                     f'at {args.save}')
-                        if args.log_progress:
-                            append_to_progress_log(f'Deleted checkpoint\tIteration: {iteration_to_delete}', barrier=False)
-                    except Exception as e:
-                        print_rank_0(f'  encountered exception "{e}" when trying to delete checkpoint from '
-                                     f'iteration {iteration_to_delete:7d} at {args.save}')
-                        # Any exception encountered in checkpoint deletion can be ignored and is not fatal.
-                        pass
+                    if os.path.islink(checkpoint_name):  # TODO: Make this work with MSC remote paths?
+                        print_rank_0(f'  skipping deleting checkpoint from iteration {iteration_to_delete:7d} '
+                                        f'at {args.save} since it is a symbolic link')
+                    else:
+                        try:
+                            shutil.rmtree(checkpoint_name)  # TODO: Make this work with MSC remote paths?
+                            print_rank_0(f'  successfully deleted checkpoint from iteration {iteration_to_delete:7d} '
+                                        f'at {args.save}')
+                            if args.log_progress:
+                                append_to_progress_log(f'Deleted checkpoint\tIteration: {iteration_to_delete}', barrier=False)
+                        except Exception as e:
+                            print_rank_0(f'  encountered exception "{e}" when trying to delete checkpoint from '
+                                        f'iteration {iteration_to_delete:7d} at {args.save}')
+                            # Any exception encountered in checkpoint deletion can be ignored and is not fatal.
+                            pass
 
-                if save_retain_interval is not None:
-                    if prev_iteration > 0 and prev_iteration != iteration and prev_iteration % save_retain_interval != 0:
-                        checkpoint_name = get_checkpoint_name(args.save, iteration=prev_iteration,
-                                                              return_base_dir=True)
-                        # Don't delete if `checkpoint_name` is a symbolic link.
-                        if os.path.islink(checkpoint_name):  # TODO: Make this work with MSC remote paths?
-                            print_rank_0(f'  skipping deleting checkpoint from iteration {prev_iteration:7d} '
-                                         f'at {args.save} since it is a symbolic link')
-                        else:
-                            # Asynchronous version of delete_checkpoint(args, iteration_to_delete=prev_iteration).
-                            threading.Thread(target=delete_checkpoint, args=(args, prev_iteration,)).start()
+                if (
+                    keep_last_n_checkpoints is not None 
+                    and keep_last_n_checkpoints > 0
+                ):
+                    ckpt_dir_regex = re.compile(r"/iter_([\d]+)$")
+                    checkpoint_path_iterations = []
+
+                    for fname in glob.glob(os.path.join(args.save, 'iter_*')):
+                        
+                        tmp_iteration = 0
+                        for item in ckpt_dir_regex.finditer(fname):
+                            try:
+                                tmp_iteration = int(item.group(1))
+                            except:
+                                continue
+                        
+                        # skip now iteration
+                        if tmp_iteration == iteration:
+                            continue
+                        
+                        metric = -10000000
+                        if getattr(args, "eval_loss_save", None) is not None:
+                            eval_loss_save_file = os.path.join(get_checkpoint_name(
+                                args.eval_loss_save, tmp_iteration,
+                                return_base_dir=True
+                            ), 'eval_loss.txt')
+                            if os.path.exists(eval_loss_save_file):
+                                with open(eval_loss_save_file, 'r') as f:
+                                    metric = -float(f.read().strip())
+
+                        checkpoint_path_iterations.append((metric, tmp_iteration))
+
+                    #按照 分数, iteration 排序 小的在前面
+                    checkpoint_path_iterations = sorted(checkpoint_path_iterations, key=lambda x:(x[0], x[1]))
+                    print(f"checkpoint_path_iterations: {checkpoint_path_iterations}")
+                    all_ckpts = [
+                        checkpoint_path_iteration[-1]
+                        for checkpoint_path_iteration in checkpoint_path_iterations
+                    ]
+
+                    n_to_delete = len(all_ckpts) + 1 - keep_last_n_checkpoints
+                    if n_to_delete > 0:
+                        to_delete = all_ckpts[:n_to_delete]
+                        for ckpt in to_delete:
+                            threading.Thread(target=delete_checkpoint, args=(args, ckpt,)).start()
+
+                # if save_retain_interval is not None:
+                #     if prev_iteration > 0 and prev_iteration != iteration and prev_iteration % save_retain_interval != 0:
+                #         checkpoint_name = get_checkpoint_name(args.save, iteration=prev_iteration,
+                #                                               return_base_dir=True)
+                #         # Don't delete if `checkpoint_name` is a symbolic link.
+                #         if os.path.islink(checkpoint_name):  # TODO: Make this work with MSC remote paths?
+                #             print_rank_0(f'  skipping deleting checkpoint from iteration {prev_iteration:7d} '
+                #                          f'at {args.save} since it is a symbolic link')
+                #         else:
+                #             # Asynchronous version of delete_checkpoint(args, iteration_to_delete=prev_iteration).
+                #             threading.Thread(target=delete_checkpoint, args=(args, prev_iteration,)).start()
 
         if args.async_save:
             assert async_save_request is not None
@@ -739,6 +795,31 @@ def cleanup_old_non_persistent_checkpoint(save_dir, leave_ckpt_num=1, do_async=F
     else:
         remove_iter_ckpts(rm_iter_ckpts)
 
+def maybe_save_eval_loss(eval_loss, iteration, eval_loss_save_path):
+    """Saves eval loss if the eval loss supports it.
+
+    Args:
+        eval_loss (float): Eval loss.
+        iteration (int): Current iteration.
+        eval_loss_save_path (str): Path where the eval loss is saved.
+    """
+    if eval_loss is None or eval_loss_save_path is None or eval_loss_save_path == "":
+        return
+
+    # Save eval loss for last rank only.
+    if not is_last_rank():
+        return
+    
+    eval_loss_save_file = os.path.join(get_checkpoint_name(
+        eval_loss_save_path, iteration,
+        return_base_dir=True
+    ), 'eval_loss.txt')
+    ensure_directory_exists(eval_loss_save_file)
+
+    print(f"saving eval loss at iteration {iteration} to {eval_loss_save_file}")
+    print(f"eval loss: {eval_loss}")
+    with open(eval_loss_save_file, 'w') as f:
+        f.write(str(eval_loss))
 
 def maybe_save_dataloader_state(train_iterator, iteration, dataloader_save_path):
     """Saves dataloader state if the dataloader supports it.
