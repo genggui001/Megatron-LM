@@ -178,8 +178,9 @@ class LanguageModule(MegatronModule):
         attributes on the embedding and output layers.
         """
 
-        # Set `is_embedding_or_output_parameter` attribute.
-        if self.pre_process:
+        # Treat the MTP-stage embedding copy like the real embedding/output params
+        # so it follows the same optimizer grouping and checkpoint sharding rules.
+        if self.pre_process or getattr(self, 'mtp_process', False):
             self.embedding.word_embeddings.weight.is_embedding_or_output_parameter = True
         if self.post_process and self.output_layer.weight is not None:
             self.output_layer.weight.is_embedding_or_output_parameter = True

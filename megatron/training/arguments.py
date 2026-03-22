@@ -837,9 +837,9 @@ def validate_args(args, defaults={}):
     if args.save is not None:
         assert args.save_interval is not None
         assert args.save_interval > 0
-        if args.save_retain_interval is not None:
-            assert args.save_retain_interval > 0
-            assert args.save_retain_interval % args.save_interval == 0
+        # if args.save_retain_interval is not None:
+        #     assert args.save_retain_interval > 0
+        #     assert args.save_retain_interval % args.save_interval == 0
     if args.log_memory_interval is not None:
         assert args.log_memory_interval % args.log_interval == 0
     # Mixed precision checks.
@@ -2152,6 +2152,10 @@ def _add_checkpointing_args(parser):
     ckpt_factory = ArgumentGroupFactory(CheckpointConfig, exclude=["most_recent_k", "save_tokenizer_assets", "save_optim", "save_rng", "load_optim", "load_rng"])
     group = ckpt_factory.build_group(parser, "checkpointing")
 
+    group.add_argument("--eval-loss-save", type=str, default=None, 
+                       help="Output directory to save eval loss to. The eval loss will be saved as a text file.")
+    group.add_argument('--keep-last-n-checkpoints', type=int, default=None,
+                       help="Number of checkpoints to keep. If not specified, all checkpoints will be kept.")
     group.add_argument('--no-save-optim', action='store_true', default=None,
                        help='Do not save current optimizer.')
     group.add_argument('--no-save-rng', action='store_true', default=None,

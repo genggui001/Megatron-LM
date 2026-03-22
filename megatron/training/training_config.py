@@ -338,10 +338,10 @@ class CheckpointConfig:
     save_dgrads_interval: int | None = None
     """Number of iterations between dgrad saves."""
 
-    save_retain_interval: int | None = None
-    """Number of iterations between retained checkpoints
-    (other checkpoints except the last checkpoint are automatically deleted).
-    """
+    # save_retain_interval: int | None = None
+    # """Number of iterations between retained checkpoints
+    # (other checkpoints except the last checkpoint are automatically deleted).
+    # """
 
     most_recent_k: int | None = -1
     """Number of latest checkpoint to be saved."""

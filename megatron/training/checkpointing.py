@@ -470,7 +470,7 @@ def save_grads(save_dir, state_dict, iteration, grad_label):
 
 def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far,
                     checkpointing_context=None, pipeline_rank=None, expert_rank=None, tensor_rank=None, pipeline_parallel=None, expert_parallel=None, non_persistent_ckpt=False,
-                    train_data_iterator=None, preprocess_common_state_dict_fn = None, release=False, tp_group: Optional[torch.distributed.ProcessGroup] = None, pp_group: Optional[torch.distributed.ProcessGroup] = None, dp_cp_group: Optional[torch.distributed.ProcessGroup] = None):
+                    train_data_iterator=None, preprocess_common_state_dict_fn = None, eval_loss=None, release=False, tp_group: Optional[torch.distributed.ProcessGroup] = None, pp_group: Optional[torch.distributed.ProcessGroup] = None, dp_cp_group: Optional[torch.distributed.ProcessGroup] = None):
     """Save a model, optimizer and optionally dataloader checkpoint.
 
     Checkpointing context is used to persist some checkpointing state
@@ -548,6 +548,10 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
 
     # Save dataloader state if the dataloader supports it (currently only Megatron Energon).
     maybe_save_dataloader_state(train_data_iterator, iteration, getattr(args, "dataloader_save", None))
+
+    # Save evaluation loss only for persistent checkpoints used in ranking.
+    if not non_persistent_ckpt:
+        maybe_save_eval_loss(eval_loss, iteration, getattr(args, "eval_loss_save", None))
 
     # Save distributed optimizer's custom parameter state.
     if (
@@ -716,10 +720,11 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             def iter_finalize_fn():
                 prev_iteration = 0
                 save_retain_interval = getattr(args, 'save_retain_interval', None)  # For backwards compatibility of tests.
-                if save_retain_interval is not None:
-                    if os.path.exists(tracker_filename):  # TODO: Make this work with MSC remote paths?
-                        with open_file(tracker_filename, 'r') as f:
-                            prev_iteration = int(f.read().strip())
+                if save_retain_interval is not None and os.path.exists(tracker_filename):
+                    prev_iteration, prev_release = read_metadata(tracker_filename)
+                    if prev_release:
+                        prev_iteration = 0
+                keep_last_n_checkpoints = getattr(args, 'keep_last_n_checkpoints', None)
                 with open_file(tracker_filename, 'w') as f:
                     f.write("release" if release else str(iteration))
                 tensor_rank_to_print = (tensor_rank if tensor_rank is not None else mpu.get_tensor_model_parallel_rank()) + 1
@@ -735,6 +740,11 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                 def delete_checkpoint(args, iteration_to_delete):
                     checkpoint_name = get_checkpoint_name(args.save, iteration=iteration_to_delete,
                                                           return_base_dir=True)
+                    if os.path.islink(checkpoint_name):  # TODO: Make this work with MSC remote paths?
+                        print_rank_0(f'  skipping deleting checkpoint from iteration {iteration_to_delete:7d} '
+                                     f'at {args.save} since it is a symbolic link')
+                        return
+
                     try:
                         shutil.rmtree(checkpoint_name)  # TODO: Make this work with MSC remote paths?
                         print_rank_0(f"  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}] successfully "
@@ -750,15 +760,58 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
 
                 if save_retain_interval is not None:
                     if prev_iteration > 0 and prev_iteration != iteration and prev_iteration % save_retain_interval != 0:
-                        checkpoint_name = get_checkpoint_name(args.save, iteration=prev_iteration,
-                                                              return_base_dir=True)
-                        # Don't delete if `checkpoint_name` is a symbolic link.
-                        if os.path.islink(checkpoint_name):  # TODO: Make this work with MSC remote paths?
-                            print_rank_0(f'  skipping deleting checkpoint from iteration {prev_iteration:7d} '
-                                         f'at {args.save} since it is a symbolic link')
-                        else:
-                            # Asynchronous version of delete_checkpoint(args, iteration_to_delete=prev_iteration).
-                            threading.Thread(target=delete_checkpoint, args=(args, prev_iteration,)).start()
+                        threading.Thread(target=delete_checkpoint, args=(args, prev_iteration,)).start()
+
+                if (
+                    not non_persistent_ckpt
+                    and keep_last_n_checkpoints is not None
+                    and keep_last_n_checkpoints > 0
+                ):
+                    checkpoint_path_iterations = []
+                    save_root = Path(args.save)
+
+                    if save_root.exists():
+                        for candidate in save_root.glob("iter_*"):
+                            if not candidate.is_dir():
+                                continue
+                            if not candidate.name.startswith("iter_"):
+                                continue
+
+                            try:
+                                candidate_iteration = int(candidate.name[len("iter_"):])
+                            except ValueError:
+                                continue
+
+                            if candidate_iteration == iteration:
+                                continue
+
+                            metric = float("-inf")
+                            eval_loss_save_dir = getattr(args, "eval_loss_save", None)
+                            if eval_loss_save_dir:
+                                eval_loss_save_file = Path(
+                                    get_checkpoint_name(
+                                        eval_loss_save_dir,
+                                        candidate_iteration,
+                                        return_base_dir=True,
+                                    )
+                                ) / "eval_loss.txt"
+                                if eval_loss_save_file.exists():
+                                    try:
+                                        with open(eval_loss_save_file, 'r') as f:
+                                            metric = -float(f.read().strip())
+                                    except (OSError, ValueError):
+                                        pass
+
+                            checkpoint_path_iterations.append((metric, candidate_iteration))
+
+                    checkpoint_path_iterations = sorted(
+                        checkpoint_path_iterations, key=lambda item: (item[0], item[1])
+                    )
+                    all_ckpts = [candidate_iteration for _, candidate_iteration in checkpoint_path_iterations]
+                    n_to_delete = len(all_ckpts) + 1 - keep_last_n_checkpoints
+                    if n_to_delete > 0:
+                        for ckpt in all_ckpts[:n_to_delete]:
+                            threading.Thread(target=delete_checkpoint, args=(args, ckpt,)).start()
 
         if args.async_save:
             assert async_save_request is not None
@@ -823,6 +876,27 @@ def cleanup_old_non_persistent_checkpoint(save_dir, leave_ckpt_num=1, do_async=F
         threading.Thread(target=remove_iter_ckpts, args=(rm_iter_ckpts,)).start()
     else:
         remove_iter_ckpts(rm_iter_ckpts)
+
+
+def maybe_save_eval_loss(eval_loss, iteration, eval_loss_save_path):
+    """Save eval loss for ranking retained checkpoints."""
+    if eval_loss is None or eval_loss_save_path is None or eval_loss_save_path == "":
+        return
+
+    # Save eval loss for last rank only.
+    if not is_last_rank():
+        return
+
+    eval_loss_save_file = os.path.join(
+        get_checkpoint_name(eval_loss_save_path, iteration, return_base_dir=True),
+        'eval_loss.txt',
+    )
+    ensure_directory_exists(eval_loss_save_file)
+
+    print(f"saving eval loss at iteration {iteration} to {eval_loss_save_file}")
+    print(f"eval loss: {eval_loss}")
+    with open(eval_loss_save_file, 'w') as f:
+        f.write(str(eval_loss))
 
 
 def maybe_save_dataloader_state(train_iterator, iteration, dataloader_save_path):

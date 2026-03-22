@@ -556,17 +556,14 @@ def test_muon_optimizer_qkv_split():
 
     # Mark parameter as QKV
     model.weight.is_qkv = True
+    model.weight.muon_split_shapes = [64, 64, 64]
 
     # QKV split shapes: [Q_size, K_size, V_size]
-    qkv_split_shapes = (64, 64, 64)
-
-    # Test with split_qkv=True
     optimizer_split = TensorParallelMuon(
         params=[model.weight],
         lr=0.01,
         split_qkv=True,
         is_qkv_fn=lambda p: getattr(p, 'is_qkv', False),
-        qkv_split_shapes=qkv_split_shapes,
         num_ns_steps=5,
         pg_collection=None,
         mode="duplicated",
@@ -587,6 +584,7 @@ def test_muon_optimizer_qkv_split():
 
     # Reset model and test with split_qkv=False
     model.weight.data.fill_(1.0)
+    model.weight.grad = None
     optimizer_no_split = TensorParallelMuon(
         params=[model.weight],
         lr=0.01,
@@ -611,6 +609,72 @@ def test_muon_optimizer_qkv_split():
     assert not torch.equal(
         weight_with_split, weight_without_split
     ), "Weights should be different between split_qkv=True and split_qkv=False"
+
+
+@pytest.mark.parametrize(
+    ("split_shapes", "num_groups"),
+    [
+        ((64, 64, 32, 32), 8),
+        ((96, 96, 32, 32, 3, 3), 8),
+    ],
+)
+def test_muon_optimizer_custom_projection_split(split_shapes, num_groups):
+    """Test TensorParallelMuon with per-parameter custom projection splits."""
+    hidden_size = 256
+    output_size = sum(split_shapes) * num_groups
+    model = torch.nn.Linear(hidden_size, output_size, bias=False, dtype=torch.float32, device='cuda')
+    model.requires_grad_(True)
+    model.weight.data.fill_(1.0)
+    model.weight.is_qkv = True
+    model.weight.muon_split_shapes = list(split_shapes)
+
+    optimizer_split = TensorParallelMuon(
+        params=[model.weight],
+        lr=0.01,
+        split_qkv=True,
+        is_qkv_fn=lambda p: getattr(p, 'is_qkv', False),
+        num_ns_steps=5,
+        pg_collection=None,
+        mode="duplicated",
+    )
+
+    input_tensor = torch.randn(16, hidden_size, dtype=torch.float32, device='cuda')
+    output = model(input_tensor)
+    loss = output.sum()
+    loss.backward()
+
+    original_weight = model.weight.data.clone()
+    optimizer_split.step()
+    weight_with_split = model.weight.data.clone()
+
+    assert not torch.equal(
+        weight_with_split, original_weight
+    ), "Custom split weight should be updated with split_qkv=True"
+
+    model.weight.data.fill_(1.0)
+    model.weight.grad = None
+    optimizer_no_split = TensorParallelMuon(
+        params=[model.weight],
+        lr=0.01,
+        split_qkv=False,
+        num_ns_steps=5,
+        pg_collection=None,
+        mode="duplicated",
+    )
+
+    output = model(input_tensor)
+    loss = output.sum()
+    loss.backward()
+
+    optimizer_no_split.step()
+    weight_without_split = model.weight.data.clone()
+
+    assert not torch.equal(
+        weight_without_split, original_weight
+    ), "Custom split weight should be updated with split_qkv=False"
+    assert not torch.equal(
+        weight_with_split, weight_without_split
+    ), "Custom split should change the Newton-Schulz update result"
 
 
 def test_muon_optimizer_extra_scale_factor():

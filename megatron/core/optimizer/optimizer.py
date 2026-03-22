@@ -674,6 +674,8 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                             main_param = param.detach().clone().float()
                             # Copy tensor model parallel attributes.
                             tensor_parallel.copy_tensor_model_parallel_attributes(main_param, param)
+                            if hasattr(param, 'muon_split_shapes'):
+                                main_param.muon_split_shapes = param.muon_split_shapes
                             if hasattr(param, 'shared'):
                                 main_param.shared = param.shared
                             # Replace the optimizer params with the new fp32 copy.

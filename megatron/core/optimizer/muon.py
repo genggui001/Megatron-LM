@@ -52,7 +52,6 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         use_decoupled_weight_decay: bool = True,
         split_qkv: bool = False,
         is_qkv_fn: Callable[[torch.Tensor], bool] | None = None,
-        qkv_split_shapes: tuple[int, int, int] | None = None,
         fp32_matmul_prec: str = "medium",
         coefficient_type: str = "quintic",
         num_ns_steps: int = 5,
@@ -93,7 +92,6 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         self.mode = mode
         self.split_qkv = split_qkv
         self.is_qkv_fn = is_qkv_fn
-        self.qkv_split_shapes = qkv_split_shapes
 
         weight_decay_method = "decoupled" if use_decoupled_weight_decay else "l2"
         super().__init__(
@@ -134,29 +132,36 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             partition_dim = None
 
         if self.split_qkv and self.is_qkv_fn(p):  # type: ignore[misc]
-            # split grouped attention parameters (e.g., QKV, GQA, etc.)
+            split_shapes = getattr(p, "muon_split_shapes", None)
+            if split_shapes is None:
+                raise ValueError("Missing muon_split_shapes for Muon split parameter")
+            # Split grouped projection parameters (e.g., QKV, QGKV, zVQKba) before Newton-Schulz.
             grad_shape = grad.shape
             log_single_rank(
                 logger,
                 logging.DEBUG,
-                f'qkv split grad shape {grad_shape}, split shapes {self.qkv_split_shapes}',
+                f'muon split grad shape {grad_shape}, split shapes {split_shapes}',
             )
-            num_query_groups = grad_shape[0] // sum(self.qkv_split_shapes)
-            qkv_grads = torch.split(
-                grad.view(num_query_groups, sum(self.qkv_split_shapes), -1),
-                self.qkv_split_shapes,
+            if grad_shape[0] % sum(split_shapes) != 0:
+                raise ValueError(
+                    f"Cannot split grad with shape {grad_shape} using split shapes {split_shapes}"
+                )
+            num_query_groups = grad_shape[0] // sum(split_shapes)
+            split_grads = torch.split(
+                grad.view(num_query_groups, sum(split_shapes), -1),
+                split_shapes,
                 dim=1,
             )
-            qkv_grads = [g.reshape(-1, grad_shape[-1]) for g in qkv_grads]
+            split_grads = [g.reshape(-1, grad_shape[-1]) for g in split_grads]
 
             # Apply Newton-Schulz and scales to each component, concat back
-            qkv_grads = [
+            split_grads = [
                 self.scaled_orthogonalize_fn(g, tp_group, partition_dim).view(
                     num_query_groups, -1, grad_shape[-1]
                 )
-                for g in qkv_grads
+                for g in split_grads
             ]
-            grad = torch.cat(qkv_grads, dim=1).view(grad_shape)
+            grad = torch.cat(split_grads, dim=1).view(grad_shape)
         else:
             grad = self.scaled_orthogonalize_fn(grad, tp_group, partition_dim)
         return grad
@@ -226,16 +231,37 @@ def get_megatron_muon_optimizer(
     linear_params = []
     nonlinear_params = []
     for model_chunk in model_chunks:
-        # use config to determine qkv split shapes.
+        # Use config to determine grouped projection split shapes.
         # no need to check tp since tp splits by head and this is per head(group) dimension
         num_attention_heads = model_chunk.config.num_attention_heads
         num_query_groups = model_chunk.config.num_query_groups
         kv_channels = model_chunk.config.kv_channels
-        qkv_split_shapes = [
+        attn_proj_split_shapes = [
             num_attention_heads // num_query_groups * kv_channels,
             kv_channels,
             kv_channels,
         ]
+        gated_attn_proj_split_shapes = [
+            num_attention_heads // num_query_groups * kv_channels,
+            num_attention_heads // num_query_groups * kv_channels,
+            kv_channels,
+            kv_channels,
+        ]
+        num_v_heads = getattr(model_chunk.config, "num_v_heads", None)
+        num_k_heads = getattr(model_chunk.config, "num_k_heads", None)
+        head_v_dim = getattr(model_chunk.config, "head_v_dim", None)
+        head_k_dim = getattr(model_chunk.config, "head_k_dim", None)
+        mixer_proj_split_shapes = None
+        if None not in (num_v_heads, num_k_heads, head_v_dim, head_k_dim):
+            v_heads_per_k_head = num_v_heads // num_k_heads
+            mixer_proj_split_shapes = [
+                v_heads_per_k_head * head_v_dim,
+                v_heads_per_k_head * head_v_dim,
+                head_k_dim,
+                head_k_dim,
+                v_heads_per_k_head,
+                v_heads_per_k_head,
+            ]
         for name, param in model_chunk.named_parameters():
             if not param.requires_grad:
                 continue
@@ -244,10 +270,24 @@ def get_megatron_muon_optimizer(
             # change in optimizer
             if 'experts' in name and 'shared' not in name:
                 param.expert_tp = True
-            # add flag for qkv parameter
-            # TODO(deyuf): support MLA
+            # Mark grouped projection weights that should be split before Newton-Schulz.
             if 'linear_qkv.weight' in name and len(param.shape) == 2:
                 param.is_qkv = True
+                param.muon_split_shapes = attn_proj_split_shapes
+            elif 'self_attention.linear_qgkv.weight' in name and len(param.shape) == 2:
+                param.is_qkv = True
+                param.muon_split_shapes = gated_attn_proj_split_shapes
+            elif (
+                'mixer.in_proj.weight' in name
+                and len(param.shape) == 2
+                and mixer_proj_split_shapes is not None
+            ):
+                param.is_qkv = True
+                param.muon_split_shapes = mixer_proj_split_shapes
+            if getattr(param, "is_qkv", False) and getattr(param, "muon_split_shapes", None):
+                logger.info(
+                    f"Muon split parameter: {name}, split shapes: {param.muon_split_shapes}",
+                )
             # TODO(deyuf): currently only allow 2D non-embedding weight to avoid breaking
             if (
                 not getattr(param, 'is_embedding_or_output_parameter', False)
@@ -255,6 +295,9 @@ def get_megatron_muon_optimizer(
             ):
                 linear_params.append(param)
             else:
+                logger.info(
+                    f"Muon Non-linear parameter: {name}, shape: {param.shape}",
+                )
                 nonlinear_params.append(param)
 
     muon_kwargs = {
@@ -267,7 +310,6 @@ def get_megatron_muon_optimizer(
         "scale_mode": config.muon_scale_mode,
         "split_qkv": config.muon_split_qkv,
         "is_qkv_fn": lambda p: getattr(p, "is_qkv", False),
-        "qkv_split_shapes": qkv_split_shapes,
         "extra_scale_factor": config.muon_extra_scale_factor,
         "pg_collection": pg_collection,
         "mode": config.muon_tp_mode,

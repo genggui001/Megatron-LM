@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 # Note: --ckpt-format torch_dist has tests in tests/unit_tests/dist_checkpointing.
 import os
+import time
 from types import SimpleNamespace
 from typing import Optional
 from unittest import mock
@@ -297,6 +298,38 @@ def test_load_checkpoint(
 
         assert new_optimizer.state_dict() == optimizer.state_dict()
         assert new_opt_param_scheduler.state_dict() == opt_param_scheduler.state_dict()
+
+
+def test_keep_best_n_checkpoints(init_model_parallel, create_args, tmp_path_dist_ckpt):
+    """Keep checkpoints with the best eval loss instead of the most recent ones."""
+    args = create_args
+    args.ckpt_format = "torch"
+    args.use_dist_ckpt = False
+    args.use_distributed_optimizer = False
+
+    config = TransformerConfig(num_layers=1, kv_channels=1)
+    model = MockModel(config)
+    optimizer = MockState({"optimizer": "optimizer_state"})
+    opt_param_scheduler = MockState({"opt_param_scheduler": "scheduler_state"})
+
+    with TempNamedDir(tmp_path_dist_ckpt / "test_keep_best_n_checkpoints", sync=True) as save_dir:
+        args.save = save_dir
+        args.eval_loss_save = save_dir / "eval_loss"
+        args.keep_last_n_checkpoints = 2
+        set_args(args)
+
+        save_checkpoint(1, [model], optimizer, opt_param_scheduler, 0, eval_loss=0.5)
+        save_checkpoint(2, [model], optimizer, opt_param_scheduler, 0, eval_loss=0.7)
+        save_checkpoint(3, [model], optimizer, opt_param_scheduler, 0, eval_loss=0.4)
+
+        deleted_ckpt = save_dir / "iter_0000002"
+        wait_until = time.time() + 5
+        while deleted_ckpt.exists() and time.time() < wait_until:
+            time.sleep(0.1)
+
+        assert os.path.exists(save_dir / "iter_0000001")
+        assert not os.path.exists(deleted_ckpt)
+        assert os.path.exists(save_dir / "iter_0000003")
 
 
 def test_dist_checkpoint_versioning(init_model_parallel, tmp_path_dist_ckpt, create_ckpt_load_args):
