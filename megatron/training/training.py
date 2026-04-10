@@ -1629,6 +1629,22 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         else:
             adjust_tensor_shapes_fn = None
 
+        if adjust_tensor_shapes_fn is None:
+            try:
+                get_adjust_tensor_shapes_fn = get_attr_wrapped_model(
+                    model[0], "get_tensor_shapes_adjust_fn"
+                )
+            except RuntimeError:
+                get_adjust_tensor_shapes_fn = None
+
+            if get_adjust_tensor_shapes_fn is not None:
+                adjust_tensor_shapes_fn = get_adjust_tensor_shapes_fn(
+                    seq_length=args.seq_length,
+                    micro_batch_size=args.micro_batch_size,
+                    decoder_seq_length=args.decoder_seq_length,
+                    forward_only=False,
+                )
+
         # For the mxfp8_param with reuse_grad_buf_for_mxfp8_param_ag and dp_ag_overlap,
         # we need to call the _copy_main_params_to_param_buffer() after the grad buffer
         # is zeroed by zero_grad_buffer() because param and grad buffer are shared.
