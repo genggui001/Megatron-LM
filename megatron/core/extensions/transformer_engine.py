@@ -1456,6 +1456,57 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
 
 if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
+    class _FakeInt4QuantizationSTE(torch.autograd.Function):
+        
+        @staticmethod
+        def forward(ctx, x, group_size):
+            m, n = x.shape
+            block_size_m, block_size_n = 1, group_size
+
+            assert n % block_size_n == 0, "Input dimensions must be divisible by block sizes."
+
+            x_view = x.view(
+                m // block_size_m,
+                block_size_m,
+                n // block_size_n,
+                block_size_n,
+            )
+
+            x_max = x_view.abs().amax(dim=(1, 3), keepdim=True)
+
+            q_min = -8
+            q_max = 7
+            scale_denom = (q_max - q_min) / 2.0  # 7.5
+
+            x_scale = x_max / scale_denom
+            x_scale = torch.where(
+                x_scale == 0,
+                torch.full_like(x_scale, torch.finfo(x_scale.dtype).eps),
+                x_scale,
+            )
+
+            x_q = torch.round(x_view / x_scale)
+            x_q = x_q.clamp(q_min, q_max)
+
+            x_dequant_view = x_q * x_scale
+            x_out = x_dequant_view.view_as(x).to(x.dtype)
+
+            return x_out
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            return grad_output, None
+
+
+    def fake_int4_quantization_ste(x, group_size):
+        x_out = _FakeInt4QuantizationSTE.apply(x, group_size)
+        
+        if hasattr(x, 'main_grad'):
+            x_out.main_grad = x.main_grad
+            
+        return x_out
+
+
     class TEGroupedLinear(te.pytorch.GroupedLinear):
         """
         Wrapper for the Transformer-Engine's `GroupedLinear` layer.
@@ -1479,6 +1530,8 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             is_expert: bool = False,
             tp_comm_buffer_name: Optional[str] = None,
             pg_collection: Optional[ProcessGroupCollection] = None,
+            use_fake_int4_quantization: bool = False,
+            use_fake_int4_quantization_group_size: int = 0,
         ):
             self.config = config
 
@@ -1490,6 +1543,13 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             self.te_return_bias = skip_bias_add and bias
             self.is_first_microbatch = True
             self.disable_parameter_transpose_cache = self.config.disable_parameter_transpose_cache
+            self.use_fake_int4_quantization = use_fake_int4_quantization
+            self.use_fake_int4_quantization_group_size = use_fake_int4_quantization_group_size
+
+            if self.use_fake_int4_quantization and self.use_fake_int4_quantization_group_size <= 0:
+                raise ValueError(
+                    "use_fake_int4_quantization_group_size must be > 0 when fake int4 quantization is enabled."
+                )
 
             extra_kwargs = _get_extra_te_kwargs(config)
 
@@ -1653,6 +1713,18 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 self.te_quant_params, self.training, is_context_quantized
             )
 
+        def _get_weight_tensors(self):
+            """Get the weight tensors of the module."""
+            weight_tensors = super()._get_weight_tensors()
+
+            if self.use_fake_int4_quantization and self.use_fake_int4_quantization_group_size > 0:
+                weight_tensors = [
+                    fake_int4_quantization_ste(w, self.use_fake_int4_quantization_group_size) 
+                    for w in weight_tensors
+                ]
+                
+            return weight_tensors
+        
         def forward(self, x, m_splits):
             """Forward."""
             _is_first_microbatch = (
@@ -1825,6 +1897,8 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             is_expert: bool,
             tp_comm_buffer_name: Optional[str] = None,
             pg_collection: Optional[ProcessGroupCollection] = None,
+            use_fake_int4_quantization: bool = False,
+            use_fake_int4_quantization_group_size: int = 0,
         ):
             super().__init__(
                 num_gemms=num_gemms,
@@ -1838,6 +1912,8 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 is_expert=is_expert,
                 tp_comm_buffer_name=tp_comm_buffer_name,
                 pg_collection=pg_collection,
+                use_fake_int4_quantization=use_fake_int4_quantization,
+                use_fake_int4_quantization_group_size=use_fake_int4_quantization_group_size,
             )
 
         def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
@@ -1871,6 +1947,8 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             is_expert: bool,
             tp_comm_buffer_name: Optional[str] = None,
             pg_collection: Optional[ProcessGroupCollection] = None,
+            use_fake_int4_quantization: bool = False,
+            use_fake_int4_quantization_group_size: int = 0,
         ):
             super().__init__(
                 num_gemms=num_gemms,
@@ -1884,6 +1962,8 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 is_expert=is_expert,
                 tp_comm_buffer_name=tp_comm_buffer_name,
                 pg_collection=pg_collection,
+                use_fake_int4_quantization=use_fake_int4_quantization,
+                use_fake_int4_quantization_group_size=use_fake_int4_quantization_group_size,
             )
 
         def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
