@@ -605,6 +605,15 @@ class TEGroupedMLP(MegatronModule):
             self.quantization_padding = Fp8Padding(self.num_local_experts)
             self.quantization_unpadding = Fp8Unpadding(self.num_local_experts)
 
+        self.fake_activation_type = getattr(self.config, 'moe_expert_fake_activation_type', None)
+        self.fake_activation_group_size = getattr(self.config, 'moe_expert_fake_activation_group_size', 16)
+        if self.fake_activation_type == "nvfp4":
+            from qdq.nvfp4 import fake_nvfp4_quantization_ste
+            self._fake_activation_ste = fake_nvfp4_quantization_ste
+        elif self.fake_activation_type == "fp8_e4m3":
+            from qdq.fp8_e4m3 import fake_fp8_e4m3_quantization_ste
+            self._fake_fp8_e4m3_ste = fake_fp8_e4m3_quantization_ste
+
     @staticmethod
     def _apply_bias(intermediate_parallel, bias_parallel, tokens_per_expert, permuted_probs):
         if bias_parallel is None:
@@ -642,12 +651,18 @@ class TEGroupedMLP(MegatronModule):
         Return:
             output (torch.Tensor): The output of the local experts.
         """
+        # Keep the original device tensor for fused per-expert fake QDQ. TE
+        # grouped linear still consumes the host list below.
+        fake_quant_tokens_per_expert = tokens_per_expert
         tokens_per_expert = tokens_per_expert.tolist()
         if self.config.fp8 or self.config.fp4:
             actual_tokens_per_expert = tokens_per_expert
             permuted_local_hidden_states, tokens_per_expert = self.quantization_padding(
                 permuted_local_hidden_states, tokens_per_expert
             )
+            # Padding changes the expert segment lengths, so use the padded
+            # counts. The QDQ package moves this small list to the input device.
+            fake_quant_tokens_per_expert = tokens_per_expert
             permuted_probs, _ = self.quantization_padding(
                 permuted_probs.unsqueeze(-1), actual_tokens_per_expert
             )
@@ -663,6 +678,16 @@ class TEGroupedMLP(MegatronModule):
             permuted_local_hidden_states = permuted_local_hidden_states.to(original_dtype)
             # Probs already applied, so reset to 1.
             permuted_probs = torch.ones_like(permuted_probs)
+
+        # FC1 input fake activation quantization (shared across all experts)
+        if self.fake_activation_type == "nvfp4":
+            permuted_local_hidden_states = self._fake_activation_ste(
+                permuted_local_hidden_states, self.fake_activation_group_size
+            )
+        elif self.fake_activation_type == "fp8_e4m3":
+            permuted_local_hidden_states = self._fake_fp8_e4m3_ste(
+                permuted_local_hidden_states, per_token=True
+            )
 
         with off_interface(
             self.offload_expert_fc1, permuted_local_hidden_states, "expert_fc1"
@@ -744,6 +769,20 @@ class TEGroupedMLP(MegatronModule):
         else:
             with off_interface(self.offload_moe_act, fc1_output, "moe_act") as fc1_output:
                 bias_act_output = bias_act_func(fc1_output, bias_parallel, permuted_probs)
+
+        # FC2 input fake activation quantization
+        if self.fake_activation_type == "nvfp4":
+            # NVFP4: per-expert global scale (each expert has its own amax)
+            bias_act_output = self._fake_activation_ste(
+                bias_act_output,
+                self.fake_activation_group_size,
+                tokens_per_expert=fake_quant_tokens_per_expert,
+            )
+        elif self.fake_activation_type == "fp8_e4m3":
+            # FP8 E4M3: per-token scale (independent of expert assignment)
+            bias_act_output = self._fake_fp8_e4m3_ste(
+                bias_act_output, per_token=True
+            )
 
         output, output_bias = self.linear_fc2(bias_act_output, tokens_per_expert)
         if self.activation_recompute:
