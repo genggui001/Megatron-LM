@@ -755,9 +755,6 @@ class TEGroupedMLP(MegatronModule):
                     intermediate_parallel = glu(intermediate_parallel)
                 else:
                     intermediate_parallel = self.activation_func(intermediate_parallel)
-                original_dtype = intermediate_parallel.dtype
-                intermediate_parallel = intermediate_parallel * permuted_probs
-                intermediate_parallel = intermediate_parallel.to(original_dtype)
             return intermediate_parallel
 
         if self.activation_recompute:
@@ -783,6 +780,11 @@ class TEGroupedMLP(MegatronModule):
             bias_act_output = self._fake_fp8_e4m3_ste(
                 bias_act_output, per_token=True
             )
+
+        # Apply router probability after FC2-input activation QDQ.
+        original_dtype = bias_act_output.dtype
+        bias_act_output = bias_act_output * permuted_probs
+        bias_act_output = bias_act_output.to(original_dtype)
 
         output, output_bias = self.linear_fc2(bias_act_output, tokens_per_expert)
         if self.activation_recompute:
